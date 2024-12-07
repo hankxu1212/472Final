@@ -1,0 +1,111 @@
+#version 460
+
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_EXT_nonuniform_qualifier : enable
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_ray_tracing : enable
+#extension GL_EXT_ray_query : enable
+
+#include "../glsl/sampling.glsl"
+#include "../glsl/random.glsl"
+#include "../../backend/raytracing/RTDefines.h"
+
+// TODO: make this specialization constant
+const int GROUP_SIZE = 16;
+layout(local_size_x = GROUP_SIZE, local_size_y = GROUP_SIZE) in;
+
+layout(set=0,binding=2, rgba32f) uniform image2D G_Normal;
+
+layout(set=1,binding=0) uniform accelerationStructureEXT topLevelAS;
+layout(set=1,binding=2, r32f) uniform image2D raytracedAO;
+
+// AOControl
+layout(push_constant) uniform params_
+{
+    float rtao_radius;
+    int   rtao_samples;
+    float rtao_power;
+    int   rtao_distance_based;
+    int   frame_number;
+    int   max_samples;
+};
+
+// Tracing a ray and returning the weight based on the distance of the hit
+float TraceRay(in rayQueryEXT rayQuery, in vec3 origin, in vec3 direction)
+{
+    // ignore any-hit shaders and closest-hit shaders , and terminate the ray on the first found intersection
+    uint flags = gl_RayFlagsOpaqueEXT | gl_RayFlagsSkipClosestHitShaderEXT | gl_RayFlagsTerminateOnFirstHitEXT;
+
+    rayQueryInitializeEXT(rayQuery, topLevelAS, flags, INSTANCE_OPAQUE, origin, 0.0f, direction, rtao_radius);
+
+    // Start traversal: return false if traversal is complete
+    while(rayQueryProceedEXT(rayQuery)) { }
+
+    float intersectionType = rayQueryGetIntersectionTypeEXT(rayQuery, true);
+    return (intersectionType != gl_RayQueryCommittedIntersectionNoneEXT)
+        ? (rtao_distance_based == 0 ? 1.0f : (1.0f - (rayQueryGetIntersectionTEXT(rayQuery, true) / rtao_radius)))
+        : 0.0f;
+}
+
+void main()
+{
+    float occlusion = 0.0;
+
+    ivec2 size = imageSize(G_Normal);
+    // Check if not outside boundaries
+    if(gl_GlobalInvocationID.x >= size.x || gl_GlobalInvocationID.y >= size.y)
+    return;
+
+    // Initialize the random number
+    uint seed = tea(size.x * gl_GlobalInvocationID.y + gl_GlobalInvocationID.x, frame_number);
+
+    // Retrieving position and normal
+    ivec2 uv = ivec2(gl_GlobalInvocationID.xy);
+    vec4 gBuffer = imageLoad(G_Normal, uv);
+
+    // Shooting rays only if a fragment was rendered
+    if(gBuffer != vec4(0))
+    {
+        vec3 origin = gBuffer.xyz;
+        vec3 normal = DecompressUnitVec(floatBitsToUint(gBuffer.w));
+        vec3 direction;
+
+        // Move origin slightly away from the surface to avoid self-occlusion
+        origin = OffsetRay(origin, normal);
+
+        // Finding the basis (tangent and bitangent) from the normal
+        vec3 tangent, bitangent;
+        ComputeDefaultBasis(normal, tangent, bitangent);
+
+        // Sampling hemiphere n-time
+        for(int i = 0; i < rtao_samples; i++)
+        {
+            // Cosine sampling
+            vec3 direction = CosineSampleHemisphereZ(rnd(seed), rnd(seed));
+            direction       = direction.x * tangent + direction.y * bitangent + direction.z * normal;
+
+            // Initializes a ray query object but does not start traversal
+            rayQueryEXT rayQuery;
+
+            occlusion += TraceRay(rayQuery, origin, direction);
+        }
+
+        // Computing occlusion
+        occlusion = 1 - (occlusion / rtao_samples);
+        occlusion = pow(clamp(occlusion, 0, 1), rtao_power);
+    }
+
+    // Writting out the AO
+    if(frame_number == 0)
+    {
+        imageStore(raytracedAO, uv, vec4(occlusion));
+    }
+    else
+    {
+        // Accumulating over time
+        float old_ao     = imageLoad(raytracedAO, uv).x;
+        float new_result = mix(old_ao, occlusion, 1.0f / float(frame_number + 1));
+        imageStore(raytracedAO, uv, vec4(new_result));
+    }
+}
